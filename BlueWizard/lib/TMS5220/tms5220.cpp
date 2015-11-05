@@ -515,6 +515,42 @@ void tms5220_device::data_write(int data)
 					m_new_frame_k_idx[i] = 0xF;
 				for (i = 7; i < m_coeff->num_k; i++)
 					m_new_frame_k_idx[i] = 0x7;
+				if (use_no_leading_silence_hack)
+				{
+					// hack to force first frame to immediately interpolate in and start talking right now
+					m_TALKD = 1;
+					m_IP = 0;
+					m_PC = 12;
+					m_subcycle = FORCE_SUBC_RELOAD;
+					/* Parse a new frame into the new_target_energy, new_target_pitch and new_target_k[] */
+					parse_frame();
+					if ( ((OLD_FRAME_UNVOICED_FLAG == 0) && (NEW_FRAME_UNVOICED_FLAG == 1))
+						|| ((OLD_FRAME_UNVOICED_FLAG == 1) && (NEW_FRAME_UNVOICED_FLAG == 0))
+						|| ((OLD_FRAME_SILENCE_FLAG == 1) && (NEW_FRAME_SILENCE_FLAG == 0))
+						//|| ((m_inhibit == 1) && (OLD_FRAME_UNVOICED_FLAG == 1) && (NEW_FRAME_SILENCE_FLAG == 1)) ) //TMS51xx INTERP BUG1
+						|| ((OLD_FRAME_UNVOICED_FLAG == 1) && (NEW_FRAME_SILENCE_FLAG == 1)) )
+						m_inhibit = 1;
+					else // normal frame, normal interpolation
+						m_inhibit = 0;
+					int inhibit_state = ((m_inhibit==1)&&(m_IP != 0)); // disable inhibit when reaching the last interp period, but don't overwrite the m_inhibit value
+					/* now force the new frame into the current frame values */
+					if (m_IP==0) m_pitch_zero = 0; // this reset happens around the second subcycle during IP=0
+					m_current_energy = (m_current_energy + (((m_coeff->energytable[m_new_frame_energy_idx] - m_current_energy)*(1-inhibit_state)) INTERP_SHIFT))*(1-m_zpar);
+					m_current_pitch = (m_current_pitch + (((m_coeff->pitchtable[m_new_frame_pitch_idx] - m_current_pitch)*(1-inhibit_state)) INTERP_SHIFT))*(1-m_zpar);
+					for (i = 0; i < 10; i++)
+					{
+						if (!use_raw_excitation_filter)
+							m_current_k[i] = (m_current_k[i] + (((m_coeff->ktable[i][m_new_frame_k_idx[i]] - m_current_k[i])*(1-inhibit_state)) INTERP_SHIFT))*(1-(((i)<4)?m_zpar:m_uv_zpar));
+						else
+							m_current_k[i] = 0;
+						}
+					/* if the new frame is a stop frame, unset both TALK and SPEN (via TCON). TALKD remains active while the energy is ramping to 0. */
+					if (NEW_FRAME_STOP_FLAG == 1)
+					{
+						m_TALK = m_SPEN = 0;
+						update_fifo_status_and_ints(); // probably not necessary...
+					}
+				}
 			}
 		}
 		else
@@ -1153,6 +1189,9 @@ INT32 tms5220_device::lattice_filter()
 		m_u[2] = m_u[3] - matrix_multiply(m_current_k[2], m_x[2]);
 		m_u[1] = m_u[2] - matrix_multiply(m_current_k[1], m_x[1]);
 		m_u[0] = m_u[1] - matrix_multiply(m_current_k[0], m_x[0]);
+#ifdef DEBUG_LATTICE
+		INT32 err = m_x[9] + matrix_multiply(m_current_k[9], m_u[9]); //x_10, real chip doesn't use or calculate this
+#endif
 		m_x[9] = m_x[8] + matrix_multiply(m_current_k[8], m_u[8]);
 		m_x[8] = m_x[7] + matrix_multiply(m_current_k[7], m_u[7]);
 		m_x[7] = m_x[6] + matrix_multiply(m_current_k[6], m_u[6]);
@@ -1170,9 +1209,14 @@ INT32 tms5220_device::lattice_filter()
 		for (i = 9; i >= 0; i--)
 		{
 			logerror("Y%d:%04d ", i+1, m_u[i]);
-			logerror("b%d:%04d ", i+1, m_x[i]);
-			if ((i % 5) == 0) logerror("\n");
 		}
+		logerror("\n");
+		logerror("E:%04d ", err);
+		for (i = 9; i >= 0; i--)
+		{
+			logerror("b%d:%04d ", i+1, m_x[i]);
+		}
+		logerror("\n");
 #endif
 		return m_u[0];
 }
@@ -1937,4 +1981,16 @@ void tms5220_device::set_frequency(int frequency)
 void tms5220_device::set_use_raw_excitation_filter(bool yes_or_no)
 {
     use_raw_excitation_filter = yes_or_no;
+}
+
+/**********************************************************************************************
+
+ tms5220_set_use_no_leading_silence_hack -- whether we start speech by forcing the first
+ frame to be immediately interpolated in and immediately start the second frame afterward
+
+ ***********************************************************************************************/
+
+void tms5220_device::set_use_no_leading_silence_hack(bool yes_or_no)
+{
+    use_no_leading_silence_hack = yes_or_no;
 }
